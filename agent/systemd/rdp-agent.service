@@ -1,0 +1,16 @@
+[Unit]
+Description=Agent RDP Docker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/rdp-agent
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/rdp-agent/venv/bin/python agent.py
+Restart=on-failure
+User=rdpagent
+Group=rdpagent
+
+[Install]
+WantedBy=multi-user.target

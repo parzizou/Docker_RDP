@@ -1,0 +1,5 @@
+# Liste des images autorisées (Docker Hub)
+# Format: repository/image:tag
+monorg/rdp-ubuntu:latest
+monorg/rdp-debian:latest
+monorg/rdp-fedora:latest
