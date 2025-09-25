@@ -1,0 +1,2 @@
+# Format: username:password_hash:first_login
+# Le format est: username:hash_sha256_du_mot_de_passe:première_connexion

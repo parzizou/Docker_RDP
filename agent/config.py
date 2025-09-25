@@ -30,3 +30,12 @@ GPU_ENABLED = os.getenv("GPU_ENABLED", "true").lower() in ("1", "true", "yes")
 
 # Forcer docker pull systématique ?
 PULL_ALWAYS = os.getenv("PULL_ALWAYS", "false").lower() in ("1", "true", "yes")
+
+# Intervalle de vérification et nettoyage des conteneurs (minutes)
+CLEANUP_INTERVAL_MINUTES = int(os.getenv("CLEANUP_INTERVAL_MINUTES", "15"))
+
+# Durée d'inactivité avant suppression d'un conteneur (minutes)
+CONTAINER_IDLE_TIMEOUT_MINUTES = int(os.getenv("CONTAINER_IDLE_TIMEOUT_MINUTES", "120"))
+
+# Token d'API pour l'authentification entre serveur et agent
+API_TOKEN = os.getenv("API_TOKEN", "")

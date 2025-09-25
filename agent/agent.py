@@ -10,7 +10,9 @@ import psutil
 from config import (
     SERVER_URL, AGENT_ID, AGENT_PORT, PUBLIC_HOST,
     HEARTBEAT_INTERVAL, RDP_PORT_RANGE_START, RDP_PORT_RANGE_END,
-    ALLOWED_IMAGES_FILE, GPU_ENABLED, PULL_ALWAYS
+    ALLOWED_IMAGES_FILE, GPU_ENABLED, PULL_ALWAYS,
+    CLEANUP_INTERVAL_MINUTES, CONTAINER_IDLE_TIMEOUT_MINUTES,
+    API_TOKEN
 )
 from utils import (
     load_allowed_images,
@@ -19,7 +21,8 @@ from utils import (
     sanitize_image,
     compute_used_cpu,
     get_running_managed_containers_count,
-    get_ip_candidate
+    get_ip_candidate,
+    cleanup_inactive_containers
 )
 
 app = Flask(__name__)
@@ -51,11 +54,47 @@ def heartbeat_loop():
                 "running_containers": running_containers,
                 "gpu_capable": GPU_CAPABLE
             }
-            requests.post(f"{SERVER_URL}/api/agents/heartbeat",
-                          json=payload, timeout=5)
+            
+            headers = {}
+            if API_TOKEN:
+                headers['Authorization'] = f'Bearer {API_TOKEN}'
+                
+            requests.post(
+                f"{SERVER_URL}/api/agents/heartbeat",
+                json=payload, headers=headers, timeout=5
+            )
         except Exception as e:
             print(f"[HB] Erreur heartbeat: {e}")
         time.sleep(HEARTBEAT_INTERVAL)
+
+# ------------------------------
+# Thread de nettoyage des conteneurs
+# ------------------------------
+def cleanup_loop():
+    while True:
+        try:
+            print(f"[CLEANUP] Vérification des conteneurs inactifs...")
+            cleaned = cleanup_inactive_containers(CONTAINER_IDLE_TIMEOUT_MINUTES)
+            if cleaned > 0:
+                print(f"[CLEANUP] {cleaned} conteneurs inactifs supprimés")
+        except Exception as e:
+            print(f"[CLEANUP] Erreur nettoyage: {e}")
+        
+        # Attendre avant la prochaine vérification
+        time.sleep(CLEANUP_INTERVAL_MINUTES * 60)
+
+# ------------------------------
+# Middleware d'authentification
+# ------------------------------
+def validate_token():
+    if not API_TOKEN:
+        return True  # Pas de token configuré = pas d'auth requise
+        
+    auth_header = request.headers.get('Authorization', '')
+    if auth_header.startswith('Bearer '):
+        token = auth_header.split(' ', 1)[1]
+        return token == API_TOKEN
+    return False
 
 # ------------------------------
 # Routes API
@@ -80,6 +119,10 @@ def execute():
     { "status": "ok", "rdp_host": "...", "rdp_port": 40123, "container_id": "xxx" }
     ou { "status": "error", "error": "message" }
     """
+    # Vérification d'authentification
+    if API_TOKEN and not validate_token():
+        return jsonify({"status": "error", "error": "Non autorisé"}), 401
+        
     start_time = time.time()
     data = request.get_json(force=True, silent=True) or {}
 
@@ -185,6 +228,10 @@ def list_containers():
 def main():
     # Thread heartbeat
     threading.Thread(target=heartbeat_loop, daemon=True).start()
+    
+    # Thread nettoyage
+    threading.Thread(target=cleanup_loop, daemon=True).start()
+    
     print(f"[AGENT] Démarrage agent {AGENT_ID} sur port {AGENT_PORT} (GPU_CAPABLE={GPU_CAPABLE})")
     app.run(host="0.0.0.0", port=AGENT_PORT)
 
