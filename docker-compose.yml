@@ -1,0 +1,28 @@
+services:
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: rdp-server
+    # Monte tout le dossier pour développement live
+    volumes:
+      - ./server:/app
+
+    environment:
+      # Change cette clé en vrai secret même en dev si accessible
+      SECRET_KEY: "dev_change_me"
+      SERVER_PORT: "5000"
+      VERBOSE_LOG: "1"
+      DRY_RUN: "0"  
+      # Tu peux ajouter ici d'autres variables si tu en ajoutes plus tard
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
+    # Mode root pour éviter les emmerdes de permission sur users.txt (changement de mdp)
+    # Pour durcir plus tard: user: "1000:1000"
+    networks:
+      - rdpnet
+
+networks:
+  rdpnet:
+    driver: bridge
