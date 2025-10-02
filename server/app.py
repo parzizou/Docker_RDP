@@ -1,7 +1,6 @@
 import os
 import time
 import requests
-import logging
 from flask import Flask, request, render_template_string, jsonify, redirect, url_for, session
 from dotenv import load_dotenv
 from users import verify_user, get_user_role, change_password
@@ -21,15 +20,6 @@ ROLE_LIMITS = {
     "standard": {"max_cpu": 4, "max_ram_gb": 4},
     "power": {"max_cpu": 10, "max_ram_gb": 32}
 }
-
-# Mode verbeux / dry-run
-VERBOSE = os.getenv("VERBOSE_LOG", "1") == "1"
-DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
-
-if VERBOSE:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-else:
-    logging.basicConfig(level=logging.WARNING)
 
 def load_agents():
     agents = []
@@ -55,8 +45,6 @@ def load_images():
             if line and not line.startswith("#"):
                 images.append(line)
     return images
-
-STATIC_AGENTS = load_agents()
 
 # ==============================
 # Templates (inchangés)
