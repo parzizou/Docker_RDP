@@ -1,21 +1,17 @@
 import os
 import time
 import threading
-import socket
-import json
 import subprocess
 from flask import Flask, request, jsonify
 import psutil
 
 from config import (
-    SERVER_URL, AGENT_ID, AGENT_PORT, PUBLIC_HOST,
-    HEARTBEAT_INTERVAL, RDP_PORT_RANGE_START, RDP_PORT_RANGE_END,
-    ALLOWED_IMAGES_FILE, GPU_ENABLED, PULL_ALWAYS,
-    CLEANUP_INTERVAL_MINUTES, CONTAINER_IDLE_TIMEOUT_MINUTES,
-    API_TOKEN
+    AGENT_ID, AGENT_PORT, PUBLIC_HOST,
+    RDP_PORT_RANGE_START, RDP_PORT_RANGE_END,
+    GPU_ENABLED,
+    CLEANUP_INTERVAL_MINUTES, CONTAINER_IDLE_TIMEOUT_MINUTES
 )
 from utils import (
-    load_allowed_images,
     detect_gpu_capability,
     pick_free_rdp_port,
     sanitize_image,
@@ -27,86 +23,57 @@ from utils import (
 
 app = Flask(__name__)
 
-ALLOWED_IMAGES = load_allowed_images(ALLOWED_IMAGES_FILE)
 GPU_CAPABLE = detect_gpu_capability() if GPU_ENABLED else False
 
 # ------------------------------
-# Heartbeat background thread
-# ------------------------------
-def heartbeat_loop():
-    import requests
-    while True:
-        try:
-            total_cpu = psutil.cpu_count()
-            used_cpu = compute_used_cpu()
-            vm = psutil.virtual_memory()
-            total_mem_mb = int(vm.total / 1024 / 1024)
-            used_mem_mb = int((vm.total - vm.available) / 1024 / 1024)
-            running_containers = get_running_managed_containers_count()
-
-            payload = {
-                "agent_id": AGENT_ID,
-                "url": f"http://{PUBLIC_HOST}:{AGENT_PORT}",
-                "total_cpu": total_cpu,
-                "used_cpu": used_cpu,
-                "total_mem_mb": total_mem_mb,
-                "used_mem_mb": used_mem_mb,
-                "running_containers": running_containers,
-                "gpu_capable": GPU_CAPABLE
-            }
-            
-            headers = {}
-            if API_TOKEN:
-                headers['Authorization'] = f'Bearer {API_TOKEN}'
-                
-            requests.post(
-                f"{SERVER_URL}/api/agents/heartbeat",
-                json=payload, headers=headers, timeout=5
-            )
-        except Exception as e:
-            print(f"[HB] Erreur heartbeat: {e}")
-        time.sleep(HEARTBEAT_INTERVAL)
-
-# ------------------------------
-# Thread de nettoyage des conteneurs
+# Thread de nettoyage des conteneurs (optionnel)
 # ------------------------------
 def cleanup_loop():
     while True:
         try:
-            print(f"[CLEANUP] Vérification des conteneurs inactifs...")
             cleaned = cleanup_inactive_containers(CONTAINER_IDLE_TIMEOUT_MINUTES)
             if cleaned > 0:
                 print(f"[CLEANUP] {cleaned} conteneurs inactifs supprimés")
         except Exception as e:
             print(f"[CLEANUP] Erreur nettoyage: {e}")
-        
-        # Attendre avant la prochaine vérification
         time.sleep(CLEANUP_INTERVAL_MINUTES * 60)
 
 # ------------------------------
-# Middleware d'authentification
-# ------------------------------
-def validate_token():
-    if not API_TOKEN:
-        return True  # Pas de token configuré = pas d'auth requise
-        
-    auth_header = request.headers.get('Authorization', '')
-    if auth_header.startswith('Bearer '):
-        token = auth_header.split(' ', 1)[1]
-        return token == API_TOKEN
-    return False
-
-# ------------------------------
-# Routes API
+# Routes
 # ------------------------------
 @app.route("/ping")
 def ping():
-    return {"status": "ok", "agent_id": AGENT_ID, "gpu": GPU_CAPABLE}
+    return {"status": "ok", "agent_id": AGENT_ID}
+
+@app.route("/info")
+def info():
+    """Retourne l'état temps-réel (remplace l'ancien heartbeat)."""
+    try:
+        total_cpu = psutil.cpu_count()
+        used_cpu = compute_used_cpu()
+        vm = psutil.virtual_memory()
+        total_mem_mb = int(vm.total / 1024 / 1024)
+        used_mem_mb = int((vm.total - vm.available) / 1024 / 1024)
+        running_containers = get_running_managed_containers_count()
+        return jsonify({
+            "agent_id": AGENT_ID,
+            "url": f"http://{PUBLIC_HOST or get_ip_candidate()}:{AGENT_PORT}",
+            "total_cpu": total_cpu,
+            "used_cpu": used_cpu,
+            "total_mem_mb": total_mem_mb,
+            "used_mem_mb": used_mem_mb,
+            "running_containers": running_containers,
+            "gpu_capable": GPU_CAPABLE,
+            "ts": int(time.time())
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/execute", methods=["POST"])
 def execute():
     """
-    Reçoit un ordre de lancement. JSON attendu :
+    Lance un container RDP.
+    Requête JSON :
     {
       "username": "...",
       "password": "...",
@@ -115,15 +82,7 @@ def execute():
       "memory_limit_mb": 4096,
       "gpu": false
     }
-    Retour :
-    { "status": "ok", "rdp_host": "...", "rdp_port": 40123, "container_id": "xxx" }
-    ou { "status": "error", "error": "message" }
     """
-    # Vérification d'authentification
-    if API_TOKEN and not validate_token():
-        return jsonify({"status": "error", "error": "Non autorisé"}), 401
-        
-    start_time = time.time()
     data = request.get_json(force=True, silent=True) or {}
 
     required = ["username", "password", "image", "cpu_limit", "memory_limit_mb", "gpu"]
@@ -140,17 +99,12 @@ def execute():
 
     if not username or not password:
         return jsonify({"status": "error", "error": "Username ou password vide"}), 400
-
-    if ALLOWED_IMAGES and image not in ALLOWED_IMAGES:
-        return jsonify({"status": "error", "error": f"Image non autorisée: {image}"}), 400
-
-    if want_gpu and (not GPU_CAPABLE):
-        return jsonify({"status": "error", "error": "GPU demandé mais agent non GPU-capable"}), 400
-
     if cpu_limit < 1:
         return jsonify({"status": "error", "error": "cpu_limit doit être >=1"}), 400
     if memory_limit_mb < 256:
         return jsonify({"status": "error", "error": "memory_limit_mb trop bas"}), 400
+    if want_gpu and not GPU_CAPABLE:
+        return jsonify({"status": "error", "error": "GPU demandé mais agent non GPU-capable"}), 400
 
     try:
         rdp_port = pick_free_rdp_port(RDP_PORT_RANGE_START, RDP_PORT_RANGE_END)
@@ -190,28 +144,23 @@ def execute():
             return jsonify({
                 "status": "error",
                 "error": f"Echec lancement: {proc.stderr.strip() or proc.stdout.strip()}"
-            }), 200
+            })
 
-        # Le script imprime l'ID du conteneur en dernière ligne
         container_id = proc.stdout.strip().splitlines()[-1].strip()
-
         host = PUBLIC_HOST or get_ip_candidate()
 
-        elapsed = round(time.time() - start_time, 2)
         return jsonify({
             "status": "ok",
             "rdp_host": host,
             "rdp_port": rdp_port,
-            "container_id": container_id,
-            "startup_seconds": elapsed
+            "container_id": container_id
         })
 
     except subprocess.TimeoutExpired:
-        return jsonify({"status": "error", "error": "Timeout lancement conteneur"}), 200
+        return jsonify({"status": "error", "error": "Timeout lancement conteneur"})
     except Exception as e:
         return jsonify({"status": "error", "error": f"Exception: {e}"}), 500
 
-# (Optionnel) Debug route pour voir conteneurs gérés
 @app.route("/containers")
 def list_containers():
     try:
@@ -226,12 +175,8 @@ def list_containers():
 
 
 def main():
-    # Thread heartbeat
-    threading.Thread(target=heartbeat_loop, daemon=True).start()
-    
-    # Thread nettoyage
+    # Thread nettoyage (optionnel)
     threading.Thread(target=cleanup_loop, daemon=True).start()
-    
     print(f"[AGENT] Démarrage agent {AGENT_ID} sur port {AGENT_PORT} (GPU_CAPABLE={GPU_CAPABLE})")
     app.run(host="0.0.0.0", port=AGENT_PORT)
 

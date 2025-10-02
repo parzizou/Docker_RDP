@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 # Usage: docker_launch.sh IMAGE CONTAINER_NAME RDP_PORT CPU_LIMIT MEMORY_LIMIT_MB GPU_FLAG USERNAME PASSWORD
-# Sort en imprimant l'ID du conteneur si succès.
 
 IMAGE="${1:-}"
 CNAME="${2:-}"
@@ -23,19 +21,14 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
-# Vérifie port libre
-if ss -ltn | awk '{print $4}' | grep -q ":$RDP_PORT\$"; then
+if ss -ltn | awk '{print $4}' | grep -q ":$RDP_PORT$"; then
   echo "Port $RDP_PORT déjà utilisé" >&2
   exit 2
 fi
 
-# Pull image (selon politique)
-if [[ "${PULL_ALWAYS:-false}" == "true" ]]; then
+# Pull auto si image absente (plus de liste blanche)
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   docker pull "$IMAGE" >/dev/null
-else
-  if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    docker pull "$IMAGE" >/dev/null
-  fi
 fi
 
 GPU_ARGS=()
@@ -45,12 +38,8 @@ if [[ "$GPU_FLAG" == "true" ]]; then
   fi
 fi
 
-# On convertit la mémoire en format Docker
 MEM_DOCKER="${MEM_LIMIT_MB}m"
 
-# Lancement
-# NOTE: On suppose que l'image démarre un service RDP sur le port 3389 dans le conteneur.
-# Les variables d'env RDP_USER / RDP_PASSWORD sont supposées prises en charge par l'image (adapter si nécessaire).
 set +e
 CID=$(docker run -d \
   --name "$CNAME" \
@@ -71,5 +60,4 @@ if [[ $RC -ne 0 ]]; then
   exit $RC
 fi
 
-# STDOUT contient l'ID du conteneur
 echo "$CID"

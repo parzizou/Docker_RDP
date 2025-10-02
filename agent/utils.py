@@ -47,10 +47,6 @@ def is_port_free(port: int):
         s.settimeout(0.2)
         return s.connect_ex(("127.0.0.1", port)) != 0
 
-def sanitize_image(image: str):
-    # Supprime espaces & caractères douteux basiques
-    return image.replace(";", "").replace("&", "").strip()
-
 def compute_used_cpu():
     # Mesure CPU% global instantané
     # psutil.cpu_percent(interval=0.1) => % usage
@@ -61,11 +57,14 @@ def compute_used_cpu():
 
 def get_running_managed_containers_count():
     try:
-        out = subprocess.check_output(
-            ["bash", "-c", "docker ps --filter 'label=managed_by=rdp_agent' --format '{{.ID}}' | wc -l"],
+        # Version sans `bash -c`
+        output = subprocess.check_output(
+            ["docker", "ps", "--filter", "label=managed_by=rdp_agent", "--format", "{{.ID}}"],
             text=True
         ).strip()
-        return int(out) if out.isdigit() else 0
+        if not output:
+            return 0
+        return len(output.splitlines())
     except Exception:
         return 0
 
@@ -88,13 +87,15 @@ def get_all_managed_containers() -> List[Dict[str, Any]]:
     Récupère les infos sur tous les conteneurs gérés par l'agent.
     """
     try:
+        # Version sans `bash -c`
         output = subprocess.check_output(
-            ["bash", "-c", """
-            docker ps -a --filter "label=managed_by=rdp_agent" --format '{"id":"{{.ID}}","status":"{{.Status}}","created":"{{.CreatedAt}}","names":"{{.Names}}"}'
-            """],
+            [
+                "docker", "ps", "-a", 
+                "--filter", "label=managed_by=rdp_agent", 
+                "--format", '{"id":"{{.ID}}","status":"{{.Status}}","created":"{{.CreatedAt}}","names":"{{.Names}}"}'
+            ],
             text=True
         )
-        # Convertir chaque ligne en objet JSON
         containers = []
         for line in output.strip().split("\n"):
             if line.strip():
@@ -113,19 +114,17 @@ def cleanup_inactive_containers(idle_minutes: int = 120) -> int:
     Retourne le nombre de conteneurs supprimés.
     """
     try:
-        # 1. Supprimer les conteneurs arrêtés
+        # 1. Supprimer les conteneurs arrêtés depuis plus d'1h pour laisser le temps de débugger
         subprocess.run(
-            ["docker", "container", "prune", "-f", "--filter", "label=managed_by=rdp_agent"],
+            ["docker", "container", "prune", "-f", "--filter", "label=managed_by=rdp_agent", "--filter", "until=1h"],
             check=True, capture_output=True, text=True
         )
         
         # 2. Identifier et supprimer les conteneurs en marche mais inactifs
         containers = get_all_managed_containers()
-        now = time.time()
         cleaned = 0
         
         for container in containers:
-            # Si le conteneur n'est pas en cours d'exécution (statut ne commence pas par "Up"), on passe
             if not container.get("status", "").startswith("Up"):
                 continue
                 
@@ -133,16 +132,15 @@ def cleanup_inactive_containers(idle_minutes: int = 120) -> int:
             if not container_id:
                 continue
                 
-            # Vérifier l'activité RDP via les logs
             try:
-                # Vérifie la dernière activité RDP dans les logs
-                last_activity = check_container_rdp_activity(container_id, idle_minutes)
+                # Vérifie la dernière activité RDP via les connexions TCP
+                last_activity_minutes = check_container_rdp_activity(container_id)
                 
-                if last_activity > idle_minutes:
-                    print(f"Conteneur {container_id} inactif depuis {last_activity} minutes, suppression...")
-                    # Arrêt puis suppression
-                    subprocess.run(["docker", "stop", container_id], check=True, capture_output=True)
-                    subprocess.run(["docker", "rm", container_id], check=True, capture_output=True)
+                if last_activity_minutes > idle_minutes:
+                    print(f"Conteneur {container_id} inactif (pas de connexion RDP détectée), suppression...")
+                    subprocess.run(["docker", "stop", container_id], check=True, capture_output=True, timeout=60)
+                    # La suppression se fera au prochain prune si besoin, mais on peut forcer
+                    subprocess.run(["docker", "rm", container_id], check=True, capture_output=True, timeout=60)
                     cleaned += 1
             except Exception as e:
                 print(f"Erreur lors du nettoyage du conteneur {container_id}: {e}")
@@ -152,43 +150,55 @@ def cleanup_inactive_containers(idle_minutes: int = 120) -> int:
         print(f"Erreur lors du nettoyage des conteneurs: {e}")
         return 0
 
-def check_container_rdp_activity(container_id: str, idle_minutes: int) -> float:
+def check_container_rdp_activity(container_id: str) -> float:
     """
-    Vérifie la dernière activité RDP d'un conteneur.
-    Retourne le nombre de minutes depuis la dernière activité.
+    Vérifie l'activité RDP d'un conteneur en cherchant des connexions TCP établies.
+    Retourne 0 si une connexion est active, sinon retourne l'âge du conteneur en minutes.
     """
-    # Obtenir le timestamp de dernière activité dans les logs
-    since = f"{idle_minutes*2}m"  # Cherche sur 2x le temps max d'inactivité
-    
     try:
-        # Rechercher des indices d'activité RDP dans les logs récents
-        logs = subprocess.check_output(
-            ["docker", "logs", "--since", since, container_id],
-            stderr=subprocess.STDOUT, text=True
+        # On vérifie les connexions établies sur le port RDP interne (3389)
+        # `ss -t -n` liste les sockets TCP. On cherche "ESTAB" et ":3389"
+        result = subprocess.run(
+            ["docker", "exec", container_id, "ss", "-t", "-n"],
+            capture_output=True, text=True, timeout=10
         )
         
-        if not logs.strip():
-            # Aucun log récent = probablement inactif
-            # On calcule l'âge du conteneur
-            inspect = json.loads(subprocess.check_output(
-                ["docker", "inspect", container_id],
-                text=True
-            ))
+        # Si la commande ss n'existe pas, on se rabat sur un comportement sûr (considérer actif)
+        if result.returncode != 0:
+             print(f"Commande 'ss' non trouvée dans {container_id} ou erreur. Conteneur considéré actif par sécurité.")
+             return 0
+
+        if "ESTAB" in result.stdout and ":3389" in result.stdout:
+            # Une connexion RDP est probablement active
+            return 0
             
-            if inspect and isinstance(inspect, list):
-                started_at = inspect[0].get("State", {}).get("StartedAt", "")
-                if started_at:
-                    # Format ISO 8601: 2023-09-25T14:53:58.123456789Z
-                    start_time = time.mktime(time.strptime(
-                        started_at.split('.')[0], 
-                        "%Y-%m-%dT%H:%M:%S"
-                    ))
-                    minutes_since_start = (time.time() - start_time) / 60
-                    return minutes_since_start
+        # Pas de connexion active. On considère le conteneur inactif depuis son démarrage.
+        # On récupère l'heure de démarrage pour calculer la durée d'inactivité.
+        inspect_out = subprocess.check_output(
+            ["docker", "inspect", container_id], text=True
+        )
+        inspect_data = json.loads(inspect_out)
         
-        # Si on a des logs, on suppose une activité récente
-        return 0
+        if inspect_data and isinstance(inspect_data, list):
+            started_at_str = inspect_data[0].get("State", {}).get("StartedAt", "")
+            if started_at_str:
+                # Format: 2023-09-25T14:53:58.123456789Z
+                start_time = time.mktime(time.strptime(
+                    started_at_str.split('.')[0], 
+                    "%Y-%m-%dT%H:%M:%S"
+                ))
+                # On ajoute le décalage du fuseau horaire local
+                start_time -= time.timezone
+                
+                minutes_since_start = (time.time() - start_time) / 60
+                return minutes_since_start
+
+    except subprocess.TimeoutExpired:
+        print(f"Timeout lors de la vérification d'activité de {container_id}. Conteneur considéré actif.")
+        return 0 # Sécurité: on considère actif en cas de timeout
     except Exception as e:
-        # En cas d'erreur, on suppose que le conteneur est actif
-        print(f"Erreur vérification activité conteneur {container_id}: {e}")
-        return 0
+        print(f"Erreur vérification activité conteneur {container_id}: {e}. Conteneur considéré actif par sécurité.")
+        return 0 # Sécurité: en cas d'erreur, on suppose qu'il est actif
+
+    # Fallback si on ne peut pas déterminer l'âge
+    return float('inf')
