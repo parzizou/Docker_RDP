@@ -1,401 +1,210 @@
 import os
 import time
-import threading
 import requests
-from flask import Flask, request, render_template_string, jsonify, redirect, url_for, session, flash
+from flask import Flask, request, render_template_string, jsonify, redirect, url_for, session
 from dotenv import load_dotenv
-from users import verify_user, change_password
+from users import verify_user
 
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY", os.urandom(24))  # Pour les sessions Flask
+app.secret_key = os.getenv("SECRET_KEY", os.urandom(24))
 
-# Durée de la session en secondes (12 heures par défaut)
-app.config['PERMANENT_SESSION_LIFETIME'] = int(os.getenv("SESSION_LIFETIME", 12 * 3600))
-
-# ==============================
-# Config minimale
-# ==============================
-AGENT_HEARTBEAT_TIMEOUT = 40          # secondes avant de considérer un agent offline
-AGENT_SELECTION_CPU_WEIGHT = 1.0
-AGENT_SELECTION_MEM_WEIGHT = 0.7
-REQUEST_TIMEOUT_SECONDS = 12          # timeout d'appel HTTP vers l'agent
-FALLBACK_RETRY_DELAY = 1.0            # pause entre essais d'agents
-IMAGES_FILE = "images.txt"
+AGENTS_FILE = "agents.txt"
+REQUEST_TIMEOUT_SECONDS = 6
+FALLBACK_RETRY_DELAY = 0.8
 
 # ==============================
-# Stockage en mémoire
+# Chargement des agents (statiques)
 # ==============================
-agents = {}  # agent_id -> dict(info)
+def load_agents():
+    agents = []
+    if not os.path.exists(AGENTS_FILE):
+        return agents
+    with open(AGENTS_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                agents.append({"agent_id": parts[0], "url": parts[1].rstrip("/")})
+    return agents
 
-# ==============================
-# Lecture des images autorisées
-# ==============================
-def load_images():
-    images = []
-    if os.path.exists(IMAGES_FILE):
-        with open(IMAGES_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    images.append(line)
-    else:
-        # fallback : liste codée en dur
-        images = [
-            "monorg/rdp-ubuntu:latest",
-            "monorg/rdp-debian:latest",
-            "monorg/rdp-fedora:latest"
-        ]
-    return images
-
-AVAILABLE_IMAGES = load_images()
+STATIC_AGENTS = load_agents()
 
 # ==============================
-# Templates HTML
+# Templates simplifiés
 # ==============================
+LOGIN_PAGE = """
+<!DOCTYPE html><html lang='fr'><head><meta charset='utf-8'><title>Login</title>
+<style>
+body{font-family:system-ui;background:#f5f6fa;padding:40px;}
+.card{background:#fff;max-width:400px;margin:40px auto;padding:25px;border-radius:10px;box-shadow:0 4px 10px rgba(0,0,0,.06);}
+input{width:100%;padding:10px;margin-top:10px;border:1px solid #ccc;border-radius:6px;}
+button{margin-top:15px;width:100%;padding:12px;background:#4361ee;color:#fff;border:none;border-radius:6px;font-size:16px;cursor:pointer;}
+.err{color:#c62828;margin-top:10px;}
+</style></head><body>
+<div class='card'>
+<h2>Connexion</h2>
+<form method='post'>
+<input name='username' placeholder='Utilisateur' autofocus required>
+<input type='password' name='password' placeholder='Mot de passe' required>
+<button>Entrer</button>
+{% if error %}<div class='err'>{{error}}</div>{% endif %}
+</form>
+</div>
+</body></html>
+"""
 
-# Template de connexion
-LOGIN_PAGE = '''
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-    <meta charset="UTF-8">
-    <title>Connexion - Bureaux Virtuels Distribués</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body { font-family: system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:#f5f6fa; margin:0; padding:25px; color:#222;}
-        .card { background:#fff; padding:20px; border-radius:10px; box-shadow:0 4px 10px rgba(0,0,0,0.06); max-width:450px; margin:50px auto 25px; }
-        h1, h2 { margin-top:0; text-align:center; }
-        label { display:block; margin-top:12px; font-weight:600; }
-        input { width:100%; padding:10px; font-size:15px; border:1px solid #ccc; border-radius:6px; }
-        button { margin-top:20px; background:#4361ee; color:#fff; border:none; padding:12px 18px; border-radius:6px; font-size:16px; cursor:pointer; width:100%;}
-        button:hover { background:#364dcc; }
-        .alert { padding:10px; border-radius:6px; margin-bottom:15px; }
-        .alert-danger { background:#ffebee; color:#c62828; }
-        .footer { margin-top:40px; font-size:12px; text-align:center; color:#666; }
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h1>Connexion</h1>
-        {% if error %}
-        <div class="alert alert-danger">{{ error }}</div>
-        {% endif %}
-        <form method="post" action="/login">
-            <label for="username">Nom d'utilisateur :</label>
-            <input type="text" id="username" name="username" required autofocus>
-            <label for="password">Mot de passe :</label>
-            <input type="password" id="password" name="password" required>
-            <button type="submit">Se connecter</button>
-        </form>
-    </div>
-    <div class="footer">
-        Bureaux Virtuels Distribués - Connexion sécurisée requise
-    </div>
-</body>
-</html>
-'''
+MAIN_PAGE = """
+<!DOCTYPE html><html lang='fr'><head><meta charset='utf-8'><title>Bureaux</title>
+<style>
+body{font-family:system-ui;background:#f5f6fa;margin:0;padding:25px;color:#222;}
+h1{margin-top:0;}
+.card{background:#fff;padding:20px;border-radius:10px;box-shadow:0 4px 10px rgba(0,0,0,.06);max-width:980px;margin:0 auto 25px;}
+input,select{width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-top:6px;}
+button{background:#4361ee;color:#fff;border:none;padding:12px 18px;border-radius:6px;font-size:15px;cursor:pointer;margin-top:15px;}
+button:hover{background:#364dcc;}
+pre{background:#111;color:#0f0;padding:15px;border-radius:8px;overflow:auto;font-size:14px;}
+.smallrow{display:flex;gap:16px;flex-wrap:wrap;}
+.smallrow > div{flex:1 1 180px;}
+table{width:100%;border-collapse:collapse;font-size:14px;}
+th,td{padding:6px 4px;text-align:left;border-bottom:1px solid #eee;}
+.bad{color:#c62828;}
+.ok{color:#2e7d32;}
+.userbar{text-align:right;margin-bottom:15px;}
+.logout{color:#333;text-decoration:none;font-size:14px;border:1px solid #ccc;padding:4px 10px;border-radius:6px;}
+.logout:hover{background:#eee;}
+</style>
+</head><body>
+<div class='userbar'>
+Connecté: <b>{{username}}</b> | <a class='logout' href='/logout'>Déconnexion</a>
+</div>
+<h1>Bureaux Virtuels (MVP)</h1>
 
-# Template de changement de mot de passe
-CHANGE_PASSWORD_PAGE = '''
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-    <meta charset="UTF-8">
-    <title>Changement de mot de passe - Bureaux Virtuels Distribués</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body { font-family: system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:#f5f6fa; margin:0; padding:25px; color:#222;}
-        .card { background:#fff; padding:20px; border-radius:10px; box-shadow:0 4px 10px rgba(0,0,0,0.06); max-width:450px; margin:50px auto 25px; }
-        h1, h2 { margin-top:0; text-align:center; }
-        label { display:block; margin-top:12px; font-weight:600; }
-        input { width:100%; padding:10px; font-size:15px; border:1px solid #ccc; border-radius:6px; }
-        button { margin-top:20px; background:#4361ee; color:#fff; border:none; padding:12px 18px; border-radius:6px; font-size:16px; cursor:pointer; width:100%;}
-        button:hover { background:#364dcc; }
-        .alert { padding:10px; border-radius:6px; margin-bottom:15px; }
-        .alert-danger { background:#ffebee; color:#c62828; }
-        .alert-info { background:#e3f2fd; color:#0d47a1; }
-        .footer { margin-top:40px; font-size:12px; text-align:center; color:#666; }
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h1>Changement de mot de passe</h1>
-        <div class="alert alert-info">Première connexion : veuillez changer votre mot de passe.</div>
-        {% if error %}
-        <div class="alert alert-danger">{{ error }}</div>
-        {% endif %}
-        <form method="post" action="/change-password">
-            <label for="new_password">Nouveau mot de passe :</label>
-            <input type="password" id="new_password" name="new_password" required autofocus>
-            <label for="confirm_password">Confirmez le mot de passe :</label>
-            <input type="password" id="confirm_password" name="confirm_password" required>
-            <button type="submit">Changer le mot de passe</button>
-        </form>
+<div class='card'>
+  <h3>Lancer un bureau</h3>
+  <form id='launchForm'>
+    <label>Image Docker (ex: ubuntu:22.04)</label>
+    <input name='image' value='ubuntu:22.04'>
+    <div class='smallrow'>
+      <div>
+        <label>CPU</label>
+        <input type='number' name='cpu_limit' value='2' min='1'>
+      </div>
+      <div>
+        <label>RAM (GB)</label>
+        <input type='number' name='memory_limit_gb' value='4' min='1'>
+      </div>
+      <div>
+        <label>GPU ?</label>
+        <select name='gpu'>
+          <option value='0'>Non</option>
+          <option value='1'>Oui</option>
+        </select>
+      </div>
     </div>
-    <div class="footer">
-        Bureaux Virtuels Distribués - Sécurisez votre compte
-    </div>
-</body>
-</html>
-'''
+    <button>Lancer</button>
+  </form>
+</div>
 
-# Template principale (mise à jour pour inclure déconnexion)
-MAIN_PAGE = '''
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-    <meta charset="UTF-8">
-    <title>Bureaux Virtuels Distribués</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body { font-family: system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:#f5f6fa; margin:0; padding:25px; color:#222;}
-        h1 { margin-top:0; }
-        .card { background:#fff; padding:20px; border-radius:10px; box-shadow:0 4px 10px rgba(0,0,0,0.06); max-width:950px; margin:0 auto 25px; }
-        label { display:block; margin-top:12px; font-weight:600; }
-        input, select { width:100%; padding:10px; font-size:15px; border:1px solid #ccc; border-radius:6px; }
-        button { margin-top:20px; background:#4361ee; color:#fff; border:none; padding:12px 18px; border-radius:6px; font-size:16px; cursor:pointer;}
-        button:hover { background:#364dcc; }
-        pre { background:#111; color:#0f0; padding:15px; border-radius:8px; overflow:auto; font-size:14px; }
-        .agents { font-size:14px; background:#fff; padding:15px; border-radius:8px; margin-top:10px; }
-        .agent-offline { opacity:0.5; }
-        .badge { display:inline-block; padding:3px 8px; border-radius:4px; font-size:12px; background:#eee; margin-right:6px;}
-        .ok { color:#2e7d32; }
-        .err { color:#c62828; }
-        .warn { color:#ed6c02; }
-        .footer { margin-top:40px; font-size:12px; text-align:center; color:#666; }
-        .flex { display:flex; gap:16px; flex-wrap:wrap; }
-        .half { flex:1 1 320px; }
-        .small { width:140px; display:inline-block; }
-        .user-info { text-align:right; margin-bottom:20px; }
-        .logout-btn { display:inline-block; background:none; border:1px solid #ccc; color:#333; padding:5px 10px; font-size:14px; cursor:pointer; text-decoration:none; }
-        .logout-btn:hover { background:#f5f5f5; }
-    </style>
-</head>
-<body>
-    <div class="user-info">
-        Connecté en tant que: <strong>{{ username }}</strong> | 
-        <a href="/logout" class="logout-btn">Déconnexion</a>
-    </div>
-    <h1>Bureaux Virtuels Distribués</h1>
-    <div class="card">
-        <form id="launchForm">
-            <label>Image Docker :</label>
-            <select name="image">
-                {% for img in images %}
-                <option value="{{ img }}">{{ img }}</option>
-                {% endfor %}
-            </select>
-            <div class="flex">
-                <div class="half">
-                    <label>CPU (vCPUs) :</label>
-                    <input type="number" name="cpu_limit" min="1" value="2">
-                </div>
-                <div class="half">
-                    <label>Mémoire (GB) :</label>
-                    <input type="number" name="memory_limit_gb" min="1" value="4">
-                </div>
-            </div>
-            <label>
-               <input type="checkbox" name="gpu" value="1"> Utiliser GPU (si dispo)
-            </label>
-            <button type="submit">Lancer le bureau</button>
-        </form>
-    </div>
-    <div class="card">
-        <h2>Résultat</h2>
-        <pre id="output">En attente...</pre>
-    </div>
-    <div class="card">
-        <h2>Agents enregistrés</h2>
-        <div class="agents" id="agentsBox">
-            Chargement...
-        </div>
-    </div>
-    <div class="footer">
-        MVP - Pas de persistance / chaque lancement crée un nouveau conteneur - Fallback auto si un agent échoue.
-    </div>
+<div class='card'>
+  <h3>Résultat</h3>
+  <pre id='output'>En attente...</pre>
+</div>
+
+<div class='card'>
+  <h3>Agents</h3>
+  <div id='agentsBox'>Chargement...</div>
+</div>
 
 <script>
-async function refreshAgents(){
-    try{
-        const r = await fetch('/api/agents');
-        const data = await r.json();
-        const box = document.getElementById('agentsBox');
-        if(!data.agents.length){
-            box.innerHTML = "<i>Aucun agent actif.</i>";
-            return;
-        }
-        let html = '<table style="width:100%; border-collapse:collapse;">';
-        html += '<tr style="text-align:left;"><th>ID</th><th>URL</th><th>CPU</th><th>Mémoire</th><th>Conteneurs</th><th>Vu</th></tr>';
-        data.agents.forEach(a=>{
-            const cls = a.online ? '' : 'agent-offline';
-            html += `<tr class="${cls}">
-                <td>${a.agent_id}</td>
-                <td>${a.url}</td>
-                <td>${a.used_cpu.toFixed(1)}/${a.total_cpu}</td>
-                <td>${a.used_mem_mb}/${a.total_mem_mb} MB</td>
-                <td>${a.running_containers}</td>
-                <td>${a.seconds_since_last_seen}s</td>
-            </tr>`;
-        });
-        html += '</table>';
-        box.innerHTML = html;
-    }catch(e){
-        console.error(e);
+async function fetchAgents(){
+  try{
+    const r = await fetch('/api/agents');
+    const data = await r.json();
+    const box = document.getElementById('agentsBox');
+    if(!data.agents.length){
+      box.innerHTML = "<i>Aucun agent</i>";
+      return;
     }
+    let html = "<table><tr><th>ID</th><th>URL</th><th>CPU (used/total)</th><th>RAM (used/total MB)</th><th>Conteneurs</th><th>GPU</th><th>OK?</th></tr>";
+    data.agents.forEach(a=>{
+      html += `<tr>
+        <td>${a.agent_id}</td>
+        <td>${a.url}</td>
+        <td>${a.used_cpu.toFixed(1)}/${a.total_cpu}</td>
+        <td>${a.used_mem_mb}/${a.total_mem_mb}</td>
+        <td>${a.running_containers}</td>
+        <td>${a.gpu_capable ? 'oui':'non'}</td>
+        <td>${a.online ? '✅':'❌'}</td>
+      </tr>`;
+    });
+    html += "</table>";
+    box.innerHTML = html;
+  }catch(e){
+    console.error(e);
+  }
 }
-setInterval(refreshAgents, 5000);
-refreshAgents();
+setInterval(fetchAgents, 5000);
+fetchAgents();
 
 document.getElementById('launchForm').addEventListener('submit', async (e)=>{
-    e.preventDefault();
-    const out = document.getElementById('output');
-    out.textContent = "Sélection de l'agent et envoi de la requête...";
-    const formData = new FormData(e.target);
-    const payload = {
-        username: "{{ username }}",  // Utilisation du nom d'utilisateur connecté
-        password: "{{ password }}",  // Le mot de passe est géré par le serveur
-        image: formData.get('image'),
-        cpu_limit: parseInt(formData.get('cpu_limit'),10),
-        memory_limit_gb: parseInt(formData.get('memory_limit_gb'),10),
-        gpu: formData.get('gpu') === '1'
-    };
-    try{
-        const r = await fetch('/launch', {
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body: JSON.stringify(payload)
-        });
-        const txt = await r.text();
-        out.textContent = txt;
-    }catch(err){
-        out.textContent = "Erreur réseau: " + err;
-    }
+  e.preventDefault();
+  const out = document.getElementById('output');
+  out.textContent = "Sélection d'un agent...";
+  const fd = new FormData(e.target);
+  const payload = {
+    image: fd.get('image'),
+    cpu_limit: parseInt(fd.get('cpu_limit'),10),
+    memory_limit_gb: parseInt(fd.get('memory_limit_gb'),10),
+    gpu: fd.get('gpu') === '1'
+  };
+  try{
+    const r = await fetch('/launch', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const txt = await r.text();
+    out.textContent = txt;
+  }catch(err){
+    out.textContent = "Erreur réseau: "+err;
+  }
 });
 </script>
-</body>
-</html>
-'''
+</body></html>
+"""
 
 # ==============================
-# Utilitaires
-# ==============================
-def now():
-    return time.time()
-
-def prune_dead_agents():
-    """Nettoie les agents très vieux (optionnel)."""
-    to_delete = []
-    for aid, info in agents.items():
-        if now() - info['last_seen'] > 3600:  # 1h
-            to_delete.append(aid)
-    for aid in to_delete:
-        agents.pop(aid, None)
-
-def compute_agent_score(info: dict) -> float:
-    """
-    Score plus haut = plus intéressant.
-    On prend CPU libre + mémoire libre pondérée - pénalité conteneurs.
-    """
-    free_cpu = max(info['total_cpu'] - info['used_cpu'], 0)
-    free_mem = max(info['total_mem_mb'] - info['used_mem_mb'], 0)
-    # pondération simple
-    score = (free_cpu * AGENT_SELECTION_CPU_WEIGHT) + \
-            ((free_mem / 1024.0) * AGENT_SELECTION_MEM_WEIGHT) - \
-            (info['running_containers'] * 0.2)
-    return score
-
-def list_sorted_candidate_agents(required_cpu: int, required_mem_mb: int, require_gpu: bool):
-    """
-    Retourne les agents triés par score desc qui ont potentiellement la capacité.
-    (On fait simple : on suppose que l'agent sait gérer la contrainte GPU si besoin via un flag 'gpu_capable')
-    """
-    candidates = []
-    now_ts = now()
-    for info in agents.values():
-        offline = (now_ts - info['last_seen']) > AGENT_HEARTBEAT_TIMEOUT
-        if offline:
-            continue
-        if require_gpu and not info.get('gpu_capable', False):
-            continue
-        # Check ressources grossière
-        if (info['total_cpu'] - info['used_cpu']) < required_cpu:
-            continue
-        if (info['total_mem_mb'] - info['used_mem_mb']) < required_mem_mb:
-            continue
-        candidates.append(info)
-    # tri par score desc
-    candidates.sort(key=lambda x: compute_agent_score(x), reverse=True)
-    return candidates
-
-# ==============================
-# Middleware d'authentification
+# Auth simple
 # ==============================
 def login_required(view_func):
-    def wrapped_view(*args, **kwargs):
+    def wrapped(*a, **kw):
         if 'username' not in session:
             return redirect(url_for('login'))
-        # Vérifier si l'utilisateur doit changer son mot de passe
-        if session.get('first_login', False):
-            return redirect(url_for('change_password_page'))
-        return view_func(*args, **kwargs)
-    wrapped_view.__name__ = view_func.__name__
-    return wrapped_view
+        return view_func(*a, **kw)
+    wrapped.__name__ = view_func.__name__
+    return wrapped
 
-# ==============================
-# Routes d'authentification
-# ==============================
-@app.route('/login', methods=['GET', 'POST'])
+@app.route('/login', methods=['GET','POST'])
 def login():
     error = None
     if request.method == 'POST':
-        username = request.form.get('username', '').strip()
-        password = request.form.get('password', '').strip()
-        
-        if not (username and password):
-            error = "Veuillez remplir tous les champs."
+        u = request.form.get('username','').strip()
+        p = request.form.get('password','').strip()
+        if not (u and p):
+            error = "Champs requis."
         else:
-            auth_success, first_login = verify_user(username, password)
-            if auth_success:
-                session['username'] = username
-                session['password'] = password  # Stocké pour les requêtes RDP
-                session['first_login'] = first_login
-                
-                if first_login:
-                    return redirect(url_for('change_password_page'))
+            ok, _ = verify_user(u, p)
+            if ok:
+                session['username'] = u
+                session['password'] = p
                 return redirect(url_for('index'))
             else:
-                error = "Nom d'utilisateur ou mot de passe incorrect."
-    
+                error = "Identifiants invalides."
     return render_template_string(LOGIN_PAGE, error=error)
-
-@app.route('/change-password', methods=['GET', 'POST'])
-def change_password_page():
-    if 'username' not in session:
-        return redirect(url_for('login'))
-    
-    error = None
-    if request.method == 'POST':
-        new_password = request.form.get('new_password', '').strip()
-        confirm_password = request.form.get('confirm_password', '').strip()
-        
-        if not (new_password and confirm_password):
-            error = "Veuillez remplir tous les champs."
-        elif new_password != confirm_password:
-            error = "Les mots de passe ne correspondent pas."
-        elif len(new_password) < 6:
-            error = "Le mot de passe doit contenir au moins 6 caractères."
-        else:
-            if change_password(session['username'], new_password):
-                session['password'] = new_password
-                session['first_login'] = False
-                return redirect(url_for('index'))
-            else:
-                error = "Erreur lors du changement de mot de passe."
-    
-    return render_template_string(CHANGE_PASSWORD_PAGE, error=error)
 
 @app.route('/logout')
 def logout():
@@ -403,108 +212,102 @@ def logout():
     return redirect(url_for('login'))
 
 # ==============================
-# Routes page principale
+# Récupération dynamique des infos agents
+# ==============================
+def fetch_agent_info(agent):
+    url = f"{agent['url']}/info"
+    try:
+        r = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
+        if r.status_code != 200:
+            return {**agent, "online": False}
+        data = r.json()
+        return {
+            "agent_id": agent["agent_id"],
+            "url": agent["url"],
+            "total_cpu": data.get("total_cpu", 0),
+            "used_cpu": data.get("used_cpu", 0),
+            "total_mem_mb": data.get("total_mem_mb", 0),
+            "used_mem_mb": data.get("used_mem_mb", 0),
+            "running_containers": data.get("running_containers", 0),
+            "gpu_capable": data.get("gpu_capable", False),
+            "online": True
+        }
+    except Exception:
+        return {
+            "agent_id": agent["agent_id"],
+            "url": agent["url"],
+            "total_cpu": 0,
+            "used_cpu": 0,
+            "total_mem_mb": 0,
+            "used_mem_mb": 0,
+            "running_containers": 0,
+            "gpu_capable": False,
+            "online": False
+        }
+
+def list_agents_live():
+    out = []
+    for a in STATIC_AGENTS:
+        out.append(fetch_agent_info(a))
+    return out
+
+# ==============================
+# Page principale
 # ==============================
 @app.route('/')
 @login_required
 def index():
-    return render_template_string(
-        MAIN_PAGE, 
-        images=AVAILABLE_IMAGES,
-        username=session.get('username', ''),
-        password=session.get('password', '')
-    )
-
-# ==============================
-# Heartbeat Agents
-# ==============================
-@app.route('/api/agents/heartbeat', methods=['POST'])
-def agent_heartbeat():
-    data = request.get_json(force=True, silent=True) or {}
-    required = ['agent_id', 'url', 'total_cpu', 'used_cpu', 'total_mem_mb', 'used_mem_mb', 'running_containers']
-    for k in required:
-        if k not in data:
-            return jsonify({'error': f'champ manquant: {k}'}), 400
-
-    agent_id = str(data['agent_id'])
-    agents[agent_id] = {
-        'agent_id': agent_id,
-        'url': data['url'].rstrip('/'),
-        'last_seen': now(),
-        'total_cpu': float(data['total_cpu']),
-        'used_cpu': float(data['used_cpu']),
-        'total_mem_mb': int(data['total_mem_mb']),
-        'used_mem_mb': int(data['used_mem_mb']),
-        'running_containers': int(data['running_containers']),
-        'gpu_capable': bool(data.get('gpu_capable', False))
-    }
-    return jsonify({'status': 'ok'})
+    return render_template_string(MAIN_PAGE, username=session.get('username',''))
 
 @app.route('/api/agents')
 @login_required
-def api_list_agents():
-    out = []
-    now_ts = now()
-    for info in agents.values():
-        seconds = int(now_ts - info['last_seen'])
-        out.append({
-            'agent_id': info['agent_id'],
-            'url': info['url'],
-            'total_cpu': info['total_cpu'],
-            'used_cpu': info['used_cpu'],
-            'total_mem_mb': info['total_mem_mb'],
-            'used_mem_mb': info['used_mem_mb'],
-            'running_containers': info['running_containers'],
-            'seconds_since_last_seen': seconds,
-            'online': seconds <= AGENT_HEARTBEAT_TIMEOUT,
-            'score': round(compute_agent_score(info), 2),
-            'gpu_capable': info.get('gpu_capable', False)
-        })
-    # tri optionnel par score
-    out.sort(key=lambda x: x['score'], reverse=True)
-    return jsonify({'agents': out})
+def api_agents():
+    return jsonify({"agents": list_agents_live()})
 
 # ==============================
-# Lancement d'un bureau
+# Lancement d'une session
 # ==============================
 @app.route('/launch', methods=['POST'])
 @login_required
 def launch():
-    """
-    1. Parse input
-    2. Sélectionne liste d'agents candidats
-    3. Essaie en push sur chaque agent (POST /execute)
-    4. Retourne le premier succès (RDP info)
-    5. Si tous échouent → message d'erreur
-    """
     try:
         data = request.get_json(force=True, silent=True) or {}
     except Exception:
-        return "Requête invalide (JSON attendu)", 400
+        return "JSON invalide", 400
 
-    # On utilise le nom d'utilisateur et mot de passe de la session
-    username = session.get('username', '')
-    password = session.get('password', '')
-    
-    image = data.get('image', '').strip()
-    cpu_limit = int(data.get('cpu_limit', 1))
-    memory_limit_gb = int(data.get('memory_limit_gb', 1))
+    username = session.get('username','')
+    password = session.get('password','')
+    image = data.get('image','').strip()
+    cpu_limit = int(data.get('cpu_limit',1))
+    memory_limit_gb = int(data.get('memory_limit_gb',1))
     gpu = bool(data.get('gpu', False))
 
     if not (username and password and image):
         return "Champs requis manquants", 400
-    if image not in AVAILABLE_IMAGES:
-        return f"Image non autorisée: {image}", 400
     if cpu_limit < 1 or memory_limit_gb < 1:
         return "Ressources invalides", 400
 
     memory_limit_mb = memory_limit_gb * 1024
 
-    # Sélectionner candidats
-    candidates = list_sorted_candidate_agents(cpu_limit, memory_limit_mb, gpu)
+    # Récupérer état live des agents
+    agents_info = list_agents_live()
+    # Filtrer agents en ligne avec ressources approximatives
+    candidates = []
+    for a in agents_info:
+        if not a['online']:
+            continue
+        free_cpu = a['total_cpu'] - a['used_cpu']
+        free_mem = a['total_mem_mb'] - a['used_mem_mb']
+        if free_cpu >= cpu_limit and free_mem >= memory_limit_mb:
+            if gpu and not a['gpu_capable']:
+                continue
+            candidates.append(a)
+
     if not candidates:
-        return ("Aucun agent n'a les ressources nécessaires ou est en ligne. "
-                "Contacte l'admin."), 503
+        return "Aucun agent n'a les ressources ou est en ligne.", 503
+
+    # Stratégie simple: prendre celui avec le plus de CPU libre
+    candidates.sort(key=lambda x: (x['total_cpu'] - x['used_cpu']), reverse=True)
 
     payload = {
         "username": username,
@@ -516,66 +319,41 @@ def launch():
     }
 
     errors = []
-    for idx, agent in enumerate(candidates, start=1):
-        agent_url = agent['url']
-        execute_url = f"{agent_url}/execute"
+    for agent in candidates:
+        execute_url = f"{agent['url']}/execute"
         try:
-            resp = requests.post(
-                execute_url,
-                json=payload,
-                timeout=REQUEST_TIMEOUT_SECONDS
-            )
+            resp = requests.post(execute_url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
         except requests.RequestException as e:
-            errors.append(f"[{agent['agent_id']}] Erreur réseau: {e}")
+            errors.append(f"[{agent['agent_id']}] réseau: {e}")
             time.sleep(FALLBACK_RETRY_DELAY)
             continue
 
         if resp.status_code != 200:
-            errors.append(f"[{agent['agent_id']}] Statut HTTP {resp.status_code}: {resp.text[:120]}")
+            errors.append(f"[{agent['agent_id']}] HTTP {resp.status_code}")
             time.sleep(FALLBACK_RETRY_DELAY)
             continue
 
-        # On suppose du JSON
         try:
             rj = resp.json()
         except Exception:
-            errors.append(f"[{agent['agent_id']}] Réponse non-JSON")
+            errors.append(f"[{agent['agent_id']}] réponse non JSON")
             continue
 
-        if rj.get('status') == 'ok':
-            rdp_host = rj.get('rdp_host', 'inconnu')
-            rdp_port = rj.get('rdp_port', '???')
-            container_id = rj.get('container_id', 'n/a')
-            # Format retour
+        if rj.get("status") == "ok":
             return (
-                f"✅ Bureau lancé avec succès sur l'agent {agent['agent_id']}.\n\n"
-                f"Connecte-toi avec RDP sur : {rdp_host}:{rdp_port}\n"
+                f"✅ Session lancée sur agent {agent['agent_id']}\n\n"
+                f"Connexion RDP : {rj.get('rdp_host')}:{rj.get('rdp_port')}\n"
                 f"USER : {username}\n"
-                f"MOT DE PASSE : {password}\n"
-                f"Container ID : {container_id}\n"
+                f"PASS : {password}\n"
+                f"Container : {rj.get('container_id')}\n"
                 f"Image : {image}\n"
-                f"CPU : {cpu_limit} | RAM : {memory_limit_gb}GB | GPU : {'oui' if gpu else 'non'}\n"
-                f"\n(Chaque lancement est fresh : pas de persistance utilisateur.)"
+                f"CPU : {cpu_limit} | RAM : {memory_limit_gb}GB | GPU : {'oui' if gpu else 'non'}"
             )
         else:
-            errors.append(f"[{agent['agent_id']}] Erreur applicative: {rj.get('error','inconnue')}")
+            errors.append(f"[{agent['agent_id']}] erreur: {rj.get('error','?')}")
             time.sleep(FALLBACK_RETRY_DELAY)
 
-    # Tous les agents ont échoué
-    return (
-        "❌ Impossible de lancer le bureau après tentative sur tous les agents.\n"
-        "Détails:\n" + "\n".join(errors) + "\n\nContacte l'admin."
-    ), 502
-
-# ==============================
-# Thread de maintenance (optionnel)
-# ==============================
-def maintenance_loop():
-    while True:
-        prune_dead_agents()
-        time.sleep(300)
-
-threading.Thread(target=maintenance_loop, daemon=True).start()
+    return "Échec sur tous les agents:\n" + "\n".join(errors), 502
 
 if __name__ == '__main__':
     port = int(os.getenv("SERVER_PORT", "5000"))
