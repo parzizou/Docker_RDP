@@ -1,24 +1,27 @@
 services:
   server:
-
     build:
       context: ./
       dockerfile: Dockerfile
     container_name: rdp-server
-    
+
+    # Monte uniquement les fichiers de config depuis l'hôte (rw)
     volumes:
-      - ./:/app
+      - ./config/users.txt:/app/users.txt:rw
+      - ./config/images.txt:/app/images.txt:rw
+      - ./config/agents.txt:/app/agents.txt:rw
 
     environment:
+      # Change cette clé en vrai secret même en prod
       SECRET_KEY: "password"
       SERVER_PORT: "5000"
       VERBOSE_LOG: "1"
-      DRY_RUN: "0"  
-
+      DRY_RUN: "0"
     ports:
       - "5000:5000"
     restart: unless-stopped
-    
+    # Mode root pour éviter les emmerdes de permission sur users.txt (changement de mdp)
+    # Pour durcir plus tard: user: "1000:1000"
     networks:
       - rdpnet
 
