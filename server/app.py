@@ -94,7 +94,7 @@ footer{margin-top:60px;text-align:center;font-size:12px;color:#566374;}
   <a class='logout' href='/logout'>Déconnexion</a>
 </div>
 
-<h1>Bureaux Virtuels Techlab</h1>
+<h1><center>Bureaux Virtuels Techlab</center></h1>
 
 <div class="grid">
   <div class='card'>
@@ -152,7 +152,7 @@ footer{margin-top:60px;text-align:center;font-size:12px;color:#566374;}
 </div>
 
 <footer>
-  Techlab • MVP interne – Pas de sécurité avancée (LAN only)
+  Techlab Mines Nancy
 </footer>
 
 <script>
@@ -266,7 +266,7 @@ footer{text-align:center;margin-top:40px;font-size:11px;color:#5f6e7d;letter-spa
     {% if error %}<div class='err'>{{error}}</div>{% endif %}
   </form>
 </div>
-<footer>MVP interne – Pas de sécurité avancée</footer>
+<footer>Techlab Mines Nancy</footer>
 </body></html>
 """
 

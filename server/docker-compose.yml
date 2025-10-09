@@ -1,0 +1,27 @@
+services:
+  server:
+
+    build:
+      context: ./
+      dockerfile: Dockerfile
+    container_name: rdp-server
+    
+    volumes:
+      - ./:/app
+
+    environment:
+      SECRET_KEY: "password"
+      SERVER_PORT: "5000"
+      VERBOSE_LOG: "1"
+      DRY_RUN: "0"  
+
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
+    
+    networks:
+      - rdpnet
+
+networks:
+  rdpnet:
+    driver: bridge
